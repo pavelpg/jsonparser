@@ -22,8 +22,10 @@ public class Main {
         System.out.println(parser.parse("\"djdjiod\""));
         System.out.println(parser.parse("\"djdjiod"));
         System.out.println(parser.parse("[ 1, 2, [ 1, 2, 3, [] ] ]"));
+        System.out.println(parser.parse("{ 1, 2, [ 1, 2, 3, [] ] }"));
         JsonNullParser nullParser = new JsonNullParser();
-        //System.out.println(nullParser.parse("null"));
+        System.out.println(nullParser.parse("null"));
+        System.out.println(JsonObjectItemParser.INSTANCE.parse("\"jjjj\": null"));
     }
 }
 
@@ -77,6 +79,15 @@ class JsonValueParser{
             return Optional.empty();
         }
     }
+
+    /**
+     * parse the input string from indexAndResult.index till the end of the string while condition is true
+     * @param input input string
+     * @param indexAndResult result of prevous parsers
+     * @param condition predicate
+     * @param value functor from string to Optional JsonValue
+     * @return result of parsing
+     */
     protected Optional<IndexAndResult> parseWhile(String input, IndexAndResult indexAndResult, IntPredicate condition, Function<String, Optional<JsonValue>> value){
         String token = input.codePoints()
                 .skip(indexAndResult.index)
@@ -85,8 +96,11 @@ class JsonValueParser{
                 .toString();
         Optional<JsonValue> optionalValue = value.apply(token);
         return optionalValue.isPresent()?
-                Optional.of(new IndexAndResult(indexAndResult.index + token.length(), optionalValue.orElse(indexAndResult.result))):
+                Optional.of(new IndexAndResult(indexAndResult.index + token.length(), optionalValue.get() == JsonValue.DUMMY?indexAndResult.result : optionalValue.get())):
                 Optional.empty();
+    }
+    protected Function<IndexAndResult, Optional<IndexAndResult>> getSkipWs(String input){
+        return item -> parseWhile(input, item, Character::isSpaceChar, str -> Optional.of(JsonValue.DUMMY));
     }
 }
 class JsonNull extends JsonValue{}
@@ -149,6 +163,7 @@ class JsonString extends JsonValue{
     }
 }
 class JsonStringParser extends JsonValueParser{
+    public static final JsonStringParser INSTANCE = new JsonStringParser();
     @Override
     protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
         Function<IndexAndResult, Optional<IndexAndResult>> parseQuote = item -> parseSubstring(input, item, "\"", null),
@@ -171,18 +186,18 @@ class JsonArray extends JsonValue{
 class JsonArrayParser extends JsonValueParser{
     @Override
     protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-
         Function<IndexAndResult, Optional<IndexAndResult>>
-                skipWs = item -> parseWhile(input, item, Character::isSpaceChar, str -> Optional.of(JsonValue.DUMMY)),
+                skipWs = getSkipWs(input),
                 parse = item -> JsonValueParser.INSTANCE.parse(input, item);
         Function<String, Function<IndexAndResult, Optional<IndexAndResult>>> parseStr = (String str) -> (IndexAndResult item) -> parseSubstring(input, item, str, null) ;
         Optional<IndexAndResult> firstBracket = parseStr.apply("[").apply(indexAndResult);
         if(firstBracket.isEmpty()) return Optional.empty();
         Optional<IndexAndResult> ws = firstBracket.flatMap(skipWs);
+        Function<IndexAndResult, Optional<IndexAndResult>> parseComma = (IndexAndResult item) -> parseSubstring(input, item, ",", null);
         var items = Stream.iterate(ws.flatMap(parse),
                 item -> item.isPresent() && item.get().result != null,
                 item ->
-                    item.flatMap(skipWs).flatMap(parseStr.apply(",")).flatMap(skipWs).flatMap(parse)
+                    item.flatMap(skipWs).flatMap(parseComma).flatMap(skipWs).flatMap(parse)
                 ).collect(Collectors.toList());
         var last = ws;
         List<JsonValue> pureItems = Collections.emptyList();
@@ -205,6 +220,53 @@ class JsonObject extends JsonValue{
 class JsonObjectParser extends JsonValueParser{
     @Override
     protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        return super.parse(input, indexAndResult);
+        // todo: get rid of copy-pasted code
+        Function<IndexAndResult, Optional<IndexAndResult>>
+                skipWs = getSkipWs(input),
+                parse = item -> JsonValueParser.INSTANCE.parse(input, item),
+                stringLiteral = item -> JsonStringParser.INSTANCE.parse(input, item);
+        Function<String, Function<IndexAndResult, Optional<IndexAndResult>>> parseStr = (String str) -> (IndexAndResult item) -> parseSubstring(input, item, str, null) ;
+        Optional<IndexAndResult> firstBracket = parseStr.apply("{").apply(indexAndResult);
+        if(firstBracket.isEmpty()) return Optional.empty();
+        Optional<IndexAndResult> ws = firstBracket.flatMap(skipWs);
+        return Optional.empty();
+    }
+}
+
+/**
+ * use as part of JsonObject/JsonObjectParser
+ */
+class JsonObjectItem extends JsonValue{
+    public final String key;
+    public final JsonValue value;
+    JsonObjectItem(String k, JsonValue v){
+        key = k;
+        value = v;
+    }
+
+    @Override
+    public String toString() {
+        return "JsonObjectItem{" +
+                "key='" + key + '\'' +
+                ", value=" + value +
+                '}';
+    }
+}
+class JsonObjectItemParser extends JsonValueParser{
+    public final static JsonObjectItemParser INSTANCE = new JsonObjectItemParser();
+    @Override
+    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
+        Function<IndexAndResult, Optional<IndexAndResult>>
+                parseStr = item -> JsonStringParser.INSTANCE.parse(input, item),
+                parseValue = item -> JsonValueParser.INSTANCE.parse(input, item),
+                parseColon = item -> parseSubstring(input, item, ":", null),
+                skipWs = getSkipWs(input);
+        var key = parseStr.apply(indexAndResult);
+        if(key.isEmpty()) return Optional.empty();
+        var value = key.flatMap(skipWs).flatMap(parseColon).flatMap(skipWs).flatMap(parseValue);
+        if(value.isEmpty()) return Optional.empty();
+        JsonString keyJsonStr = (JsonString) key.get().result;
+        String keyStr = keyJsonStr.value;
+        return Optional.of(new IndexAndResult(value.get().index, new JsonObjectItem(keyStr, value.get().result)));
     }
 }
