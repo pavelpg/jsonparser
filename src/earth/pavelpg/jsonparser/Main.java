@@ -23,19 +23,28 @@ public class Main {
         System.out.println(parser.parse("\"djdjiod"));
         System.out.println(parser.parse("[ 1, 2, [ 1, 2, 3, [] ] ]"));
         System.out.println(parser.parse("{ 1, 2, [ 1, 2, 3, [] ] }"));
+        System.out.println(parser.parse("{ \"key1\": 1, \"key2\": 2, \"key3\": [ 1, 2, 3, [{},{}] ] }"));
         JsonNullParser nullParser = new JsonNullParser();
         System.out.println(nullParser.parse("null"));
         System.out.println(JsonObjectItemParser.INSTANCE.parse("\"jjjj\": null"));
     }
 }
 
-class IndexAndResult{
+class ParseObject {
     public final int index;
     public final JsonValue result;
+    public final String string;
 
-    public IndexAndResult(int index, JsonValue result) {
+    public ParseObject(int index, JsonValue result, String string) {
         this.index = index;
         this.result = result;
+        this.string = string;
+    }
+
+    public ParseObject(int index, JsonValue result, ParseObject parseObject) {
+        this.index = index;
+        this.result = result;
+        this.string = parseObject.string;
     }
 
     @Override
@@ -51,14 +60,14 @@ class JsonValue{
 }
 class JsonValueParser{
     private static final List<JsonValueParser> PARSERS = List.of(new JsonBooleanParser(),new JsonNullParser(), new JsonNumberParser(),
-            new JsonStringParser(), new JsonArrayParser());
+            new JsonStringParser(), new JsonArrayParser(), new JsonObjectParser());
     public final static JsonValueParser INSTANCE = new JsonValueParser();
-    protected Optional<IndexAndResult> parse(String input){
-        return parse(input, new IndexAndResult(0, null));
+    protected Optional<ParseObject> parse(String input){
+        return parse(new ParseObject(0, null, input));
     }
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult){
+    protected Optional<ParseObject> parse(ParseObject parseObject){
         return PARSERS.stream()
-                .map(parser -> parser.parse(input, indexAndResult))
+                .map(parser -> parser.parse(parseObject))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
@@ -66,15 +75,15 @@ class JsonValueParser{
 
     /**
      * parse substring, pass result from previous result or create new
-     * @param input string to parse
-     * @param indexAndResult previous index and result
+     * @param parseObject previous index and result
      * @param substring substring to parse
      * @param value if null then pass result from previous result, create new if otherwise
      * @return result and index of not yet parsed char
      */
-    protected Optional<IndexAndResult> parseSubstring(String input, IndexAndResult indexAndResult, String substring, JsonValue value){
-        if(input.startsWith(substring, indexAndResult.index)){
-            return Optional.of(new IndexAndResult(indexAndResult.index + substring.length(), value == null? indexAndResult.result: value));
+    protected Optional<ParseObject> parseSubstring(ParseObject parseObject, String substring, JsonValue value){
+        String input = parseObject.string;
+        if(input.startsWith(substring, parseObject.index)){
+            return Optional.of(new ParseObject(parseObject.index + substring.length(), value == null? parseObject.result: value, input));
         }else{
             return Optional.empty();
         }
@@ -82,33 +91,64 @@ class JsonValueParser{
 
     /**
      * parse the input string from indexAndResult.index till the end of the string while condition is true
-     * @param input input string
-     * @param indexAndResult result of prevous parsers
+     * @param parseObject result of previous parsers
      * @param condition predicate
-     * @param value functor from string to Optional JsonValue
+     * @param value functor from string to Optional JsonValue (if not JsonValue.DUMMY)
      * @return result of parsing
      */
-    protected Optional<IndexAndResult> parseWhile(String input, IndexAndResult indexAndResult, IntPredicate condition, Function<String, Optional<JsonValue>> value){
+    protected Optional<ParseObject> parseWhile(ParseObject parseObject, IntPredicate condition, Function<String, Optional<JsonValue>> value){
+        String input = parseObject.string;
         String token = input.codePoints()
-                .skip(indexAndResult.index)
+                .skip(parseObject.index)
                 .takeWhile(condition)
                 .collect(StringBuilder::new, StringBuilder::appendCodePoint,StringBuilder::append)
                 .toString();
         Optional<JsonValue> optionalValue = value.apply(token);
-        return optionalValue.isPresent()?
-                Optional.of(new IndexAndResult(indexAndResult.index + token.length(), optionalValue.get() == JsonValue.DUMMY?indexAndResult.result : optionalValue.get())):
-                Optional.empty();
+        return optionalValue.map(
+                jsonValue ->
+                        new ParseObject(
+                                parseObject.index + token.length(),
+                                jsonValue == JsonValue.DUMMY? parseObject.result : jsonValue,
+                                input
+                        )
+        );
     }
-    protected Function<IndexAndResult, Optional<IndexAndResult>> getSkipWs(String input){
-        return item -> parseWhile(input, item, Character::isSpaceChar, str -> Optional.of(JsonValue.DUMMY));
+    protected Optional<ParseObject> skipWs(ParseObject item){
+        return parseWhile(item, Character::isSpaceChar, str -> Optional.of(JsonValue.DUMMY));
+    }
+    protected Optional<ParseObject> parseValue(ParseObject item){
+        return INSTANCE.parse(item);
+    }
+    protected Optional<ParseObject> parseMultipleItems(ParseObject parseObject, String firstTokenString, String lastTokenString, Function<ParseObject, Optional<? extends ParseObject>> parseValueItem, Function<List<JsonValue>, JsonValue> newMultipleValue) {
+        Function<String, Function<ParseObject, Optional<ParseObject>>> parseStr = (String str) -> (ParseObject item) -> parseSubstring(item, str, null);
+        Optional<ParseObject> firstToken = parseStr.apply(firstTokenString).apply(parseObject);
+        if(firstToken.isEmpty()) return Optional.empty();
+        Optional<ParseObject> ws = firstToken.flatMap(this::skipWs);
+        Function<ParseObject, Optional<ParseObject>> parseComma = parseStr.apply(",");
+
+        var items = Stream.iterate(ws.flatMap(parseValueItem),
+                item -> item.isPresent() && item.get().result != null,
+                item ->
+                        item.flatMap(this::skipWs).flatMap(parseComma).flatMap(this::skipWs).flatMap(parseValueItem)
+        ).collect(Collectors.toList());
+        var last = ws;
+        List<JsonValue> pureItems = Collections.emptyList();
+        if(items.size() > 0) {
+            last = items.get(items.size() - 1); // todo: ensure that the last item in list is really the last item from Stream.iterate
+            if (last.isEmpty()) return Optional.empty();
+            pureItems = items.stream().map(Optional::get).map(item -> item.result).collect(Collectors.toList());
+        }
+        var lastToken = last.flatMap(this::skipWs).flatMap(parseStr.apply(lastTokenString));
+        if(lastToken.isEmpty()) return Optional.empty();
+        return Optional.of(new ParseObject(lastToken.get().index, newMultipleValue.apply(pureItems), parseObject));
     }
 }
 class JsonNull extends JsonValue{}
 class JsonNullParser extends JsonValueParser{
     private static final JsonNull VALUE = new JsonNull();
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        return parseSubstring(input, indexAndResult, "null", VALUE);
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        return parseSubstring(parseObject, "null", VALUE);
     }
 }
 class JsonBoolean extends JsonValue{
@@ -126,9 +166,9 @@ class JsonBooleanParser extends JsonValueParser{
             TRUE = new JsonBoolean(true),
             FALSE = new JsonBoolean(false);
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult){
-        return parseSubstring(input, indexAndResult, "true", TRUE).
-                or(()->parseSubstring(input, indexAndResult, "false", FALSE) );
+    protected Optional<ParseObject> parse(ParseObject parseObject){
+        return parseSubstring(parseObject, "true", TRUE).
+                or(()->parseSubstring(parseObject, "false", FALSE) );
     }
 }
 class JsonNumber extends JsonValue{
@@ -143,8 +183,8 @@ class JsonNumber extends JsonValue{
 }
 class JsonNumberParser extends JsonValueParser{
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        return parseWhile(input, indexAndResult, Character::isDigit, str -> str.length() > 0 ?
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        return parseWhile(parseObject, Character::isDigit, str -> str.length() > 0 ?
             Optional.of(new JsonNumber(Integer.parseInt(str)))
                 : Optional.empty()
         );
@@ -165,10 +205,10 @@ class JsonString extends JsonValue{
 class JsonStringParser extends JsonValueParser{
     public static final JsonStringParser INSTANCE = new JsonStringParser();
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        Function<IndexAndResult, Optional<IndexAndResult>> parseQuote = item -> parseSubstring(input, item, "\"", null),
-            parse = item -> parseWhile(input, item, ch -> ch != '"', str -> Optional.of(new JsonString(str)));
-        return Optional.of(indexAndResult).flatMap(parseQuote).flatMap(parse).flatMap(parseQuote);
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        Function<ParseObject, Optional<ParseObject>> parseQuote = item -> parseSubstring(item, "\"", null),
+            parse = item -> parseWhile(item, ch -> ch != '"', str -> Optional.of(new JsonString(str)));
+        return Optional.of(parseObject).flatMap(parseQuote).flatMap(parse).flatMap(parseQuote);
     }
 }
 class JsonArray extends JsonValue{
@@ -185,51 +225,32 @@ class JsonArray extends JsonValue{
 }
 class JsonArrayParser extends JsonValueParser{
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        Function<IndexAndResult, Optional<IndexAndResult>>
-                skipWs = getSkipWs(input),
-                parse = item -> JsonValueParser.INSTANCE.parse(input, item);
-        Function<String, Function<IndexAndResult, Optional<IndexAndResult>>> parseStr = (String str) -> (IndexAndResult item) -> parseSubstring(input, item, str, null) ;
-        Optional<IndexAndResult> firstBracket = parseStr.apply("[").apply(indexAndResult);
-        if(firstBracket.isEmpty()) return Optional.empty();
-        Optional<IndexAndResult> ws = firstBracket.flatMap(skipWs);
-        Function<IndexAndResult, Optional<IndexAndResult>> parseComma = (IndexAndResult item) -> parseSubstring(input, item, ",", null);
-        var items = Stream.iterate(ws.flatMap(parse),
-                item -> item.isPresent() && item.get().result != null,
-                item ->
-                    item.flatMap(skipWs).flatMap(parseComma).flatMap(skipWs).flatMap(parse)
-                ).collect(Collectors.toList());
-        var last = ws;
-        List<JsonValue> pureItems = Collections.emptyList();
-        if(items.size() > 0) {
-            last = items.get(items.size() - 1); // todo: ensure that the last item in list is really the last item from Stream.iterate
-            if (last.isEmpty()) return Optional.empty();
-            pureItems = items.stream().map(Optional::get).map(item -> item.result).collect(Collectors.toList());
-        }
-        var lastBracket = last.flatMap(skipWs).flatMap(parseStr.apply("]"));
-        if(lastBracket.isEmpty()) return Optional.empty();
-        return Optional.of(new IndexAndResult(lastBracket.get().index, new JsonArray(pureItems)));
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        final String firstTokenString = "[", lastTokenString = "]";
+        final Function<ParseObject, Optional<? extends ParseObject>> parseValueItem = this::parseValue;
+
+        return parseMultipleItems(parseObject, firstTokenString, lastTokenString, parseValueItem, JsonArray::new);
     }
+
+
 }
 class JsonObject extends JsonValue{
-    public final Map<String, JsonValue> value;
-    public JsonObject(Map<String, JsonValue> value) {
-        this.value = Collections.unmodifiableMap(value);
+    public final List<JsonValue> value;
+    public JsonObject(List<JsonValue> value) { //todo: must be JsonObjectItem
+        this.value = Collections.unmodifiableList(value);
+    }
+    @Override
+    public String toString() {
+        return "JsonObject{" +
+                "value=" + value +
+                '}';
     }
 }
 class JsonObjectParser extends JsonValueParser{
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        // todo: get rid of copy-pasted code
-        Function<IndexAndResult, Optional<IndexAndResult>>
-                skipWs = getSkipWs(input),
-                parse = item -> JsonValueParser.INSTANCE.parse(input, item),
-                stringLiteral = item -> JsonStringParser.INSTANCE.parse(input, item);
-        Function<String, Function<IndexAndResult, Optional<IndexAndResult>>> parseStr = (String str) -> (IndexAndResult item) -> parseSubstring(input, item, str, null) ;
-        Optional<IndexAndResult> firstBracket = parseStr.apply("{").apply(indexAndResult);
-        if(firstBracket.isEmpty()) return Optional.empty();
-        Optional<IndexAndResult> ws = firstBracket.flatMap(skipWs);
-        return Optional.empty();
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        return parseMultipleItems(parseObject, "{", "}", JsonObjectItemParser.INSTANCE::parse,
+                JsonObject::new);
     }
 }
 
@@ -255,18 +276,16 @@ class JsonObjectItem extends JsonValue{
 class JsonObjectItemParser extends JsonValueParser{
     public final static JsonObjectItemParser INSTANCE = new JsonObjectItemParser();
     @Override
-    protected Optional<IndexAndResult> parse(String input, IndexAndResult indexAndResult) {
-        Function<IndexAndResult, Optional<IndexAndResult>>
-                parseStr = item -> JsonStringParser.INSTANCE.parse(input, item),
-                parseValue = item -> JsonValueParser.INSTANCE.parse(input, item),
-                parseColon = item -> parseSubstring(input, item, ":", null),
-                skipWs = getSkipWs(input);
-        var key = parseStr.apply(indexAndResult);
+    protected Optional<ParseObject> parse(ParseObject parseObject) {
+        Function<ParseObject, Optional<ParseObject>>
+                parseStr = JsonStringParser.INSTANCE::parse,
+                parseColon = item -> parseSubstring(item, ":", null);
+        var key = parseStr.apply(parseObject);
         if(key.isEmpty()) return Optional.empty();
-        var value = key.flatMap(skipWs).flatMap(parseColon).flatMap(skipWs).flatMap(parseValue);
+        var value = key.flatMap(this::skipWs).flatMap(parseColon).flatMap(this::skipWs).flatMap(this::parseValue);
         if(value.isEmpty()) return Optional.empty();
         JsonString keyJsonStr = (JsonString) key.get().result;
         String keyStr = keyJsonStr.value;
-        return Optional.of(new IndexAndResult(value.get().index, new JsonObjectItem(keyStr, value.get().result)));
+        return Optional.of(new ParseObject(value.get().index, new JsonObjectItem(keyStr, value.get().result), parseObject));
     }
 }
